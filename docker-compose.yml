@@ -1,0 +1,463 @@
+###############################################################################
+#                                                                             #
+#   PostgreSQL Container Backup Demo                                          #
+#   https://github.com/bauer-group/DEMO-ContainerBackupPostgreSQL             #
+#                                                                             #
+###############################################################################
+#
+#   Lokale Demo (mit MinIO):    docker compose up -d
+#   Externe S3:                 docker compose up -d postgres backup backup-sync
+#
+###############################################################################
+
+services:
+
+  #############################################################################
+  # POSTGRESQL
+  #############################################################################
+
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-16}-alpine
+    container_name: ${STACK_NAME:-demo}_postgres
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-demoapp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secretpassword}
+      POSTGRES_DB:       ${POSTGRES_DB:-demodb}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+    networks:
+      - backup-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-demoapp} -d ${POSTGRES_DB:-demodb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  #############################################################################
+  # MINIO (lokale Demo)
+  #############################################################################
+  #
+  #   Console:  http://localhost:9001
+  #   API:      http://localhost:9000
+  #
+  #   Nicht starten bei externer S3:
+  #   docker compose up -d postgres backup backup-sync
+  #
+  #############################################################################
+
+  minio:
+    image: minio/minio:latest
+    container_name: ${STACK_NAME:-demo}_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin123}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    networks:
+      - backup-network
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+  #############################################################################
+  # MINIO INIT (lokale Demo)
+  #############################################################################
+  #
+  #   Erstellt Bucket mit granularem WORM-Konzept:
+  #
+  #   Object Lock (WORM):
+  #   - Bucket-Level: GOVERNANCE (aktiviert)
+  #   - Per-Object Retention wird beim Upload gesetzt (siehe backup-sync)
+  #
+  #   Lifecycle Rules (pro Prefix):
+  #   - daily/    → 15 Tage  (lokale Retention: 7 Tage + Puffer)
+  #   - weekly/   → 36 Tage  (lokale Retention: 4 Wochen + Puffer)
+  #   - monthly/  → 186 Tage (lokale Retention: 6 Monate + Puffer)
+  #
+  #   WICHTIG: Object Lock muss bei Bucket-Erstellung aktiviert werden!
+  #   Bei bestehendem Bucket ohne Lock: docker compose down -v && up -d
+  #
+  #############################################################################
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: ${STACK_NAME:-demo}_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin123}
+      S3_BUCKET:     ${S3_BUCKET:-pg-backups}
+      S3_PREFIX:     ${S3_PREFIX:-}
+      # Granulare Retention-Zeiten (in Tagen)
+      RETENTION_DAILY:   ${RETENTION_DAILY:-14}
+      RETENTION_WEEKLY:  ${RETENTION_WEEKLY:-35}
+      RETENTION_MONTHLY: ${RETENTION_MONTHLY:-185}
+    networks:
+      - backup-network
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set storage http://minio:9000 $${S3_ACCESS_KEY} $${S3_SECRET_KEY}
+
+        # Build prefix paths (with or without S3_PREFIX)
+        if [ -n "$${S3_PREFIX}" ]; then
+          PREFIX_DAILY="$${S3_PREFIX}/daily/"
+          PREFIX_WEEKLY="$${S3_PREFIX}/weekly/"
+          PREFIX_MONTHLY="$${S3_PREFIX}/monthly/"
+          RULE_PREFIX="${S3_PREFIX}-"
+        else
+          PREFIX_DAILY="daily/"
+          PREFIX_WEEKLY="weekly/"
+          PREFIX_MONTHLY="monthly/"
+          RULE_PREFIX=""
+        fi
+
+        echo ""
+        echo "=== MinIO Bucket Initialization ==="
+        echo "Bucket:  $${S3_BUCKET}"
+        echo "Prefix:  $${S3_PREFIX:-<none>}"
+        echo ""
+
+        # Check if bucket exists
+        if mc ls storage/$${S3_BUCKET} >/dev/null 2>&1; then
+          echo "Bucket '$${S3_BUCKET}' already exists"
+          # Check if Object Lock is enabled
+          if mc retention info storage/$${S3_BUCKET} >/dev/null 2>&1; then
+            echo "Object Lock: ENABLED"
+          else
+            echo ""
+            echo "WARNING: Bucket exists WITHOUT Object Lock!"
+            echo "Object Lock kann nachträglich nicht aktiviert werden."
+            echo ""
+            echo "Für WORM-Schutz:"
+            echo "  1. docker compose down -v"
+            echo "  2. docker compose up -d"
+            echo ""
+          fi
+        else
+          echo "Creating bucket with Object Lock..."
+          mc mb --with-lock storage/$${S3_BUCKET}
+          echo "Object Lock: ENABLED"
+        fi
+
+        # Configure bucket settings
+        mc anonymous set none storage/$${S3_BUCKET}
+
+        echo ""
+        echo "Configuring granular lifecycle rules..."
+        echo "Paths: $${PREFIX_DAILY}, $${PREFIX_WEEKLY}, $${PREFIX_MONTHLY}"
+        echo ""
+
+        # Calculate expire days (retention + 1 day buffer)
+        DAILY_EXPIRE=$$(($${RETENTION_DAILY} + 1))
+        WEEKLY_EXPIRE=$$(($${RETENTION_WEEKLY} + 1))
+        MONTHLY_EXPIRE=$$(($${RETENTION_MONTHLY} + 1))
+
+        # Build last/ prefix path
+        if [ -n "$${S3_PREFIX}" ]; then
+          PREFIX_LAST="$${S3_PREFIX}/last/"
+        else
+          PREFIX_LAST="last/"
+        fi
+
+        # Add prefix-based lifecycle rules
+        # Last: stündliche Backups, 2 Tage (kein WORM)
+        mc ilm rule add \
+          --expire-days 2 \
+          --prefix "$${PREFIX_LAST}" \
+          storage/$${S3_BUCKET} 2>/dev/null && \
+          echo "  $${PREFIX_LAST} → 2 days (no WORM)" || \
+          echo "  $${PREFIX_LAST} → (exists or error)"
+
+        # Daily: lokale Retention 7d + Puffer
+        mc ilm rule add \
+          --expire-days $${DAILY_EXPIRE} \
+          --prefix "$${PREFIX_DAILY}" \
+          storage/$${S3_BUCKET} 2>/dev/null && \
+          echo "  $${PREFIX_DAILY} → $${DAILY_EXPIRE} days" || \
+          echo "  $${PREFIX_DAILY} → (exists or error)"
+
+        # Weekly: lokale Retention 28d + Puffer
+        mc ilm rule add \
+          --expire-days $${WEEKLY_EXPIRE} \
+          --prefix "$${PREFIX_WEEKLY}" \
+          storage/$${S3_BUCKET} 2>/dev/null && \
+          echo "  $${PREFIX_WEEKLY} → $${WEEKLY_EXPIRE} days" || \
+          echo "  $${PREFIX_WEEKLY} → (exists or error)"
+
+        # Monthly: lokale Retention 180d + Puffer
+        mc ilm rule add \
+          --expire-days $${MONTHLY_EXPIRE} \
+          --prefix "$${PREFIX_MONTHLY}" \
+          storage/$${S3_BUCKET} 2>/dev/null && \
+          echo "  $${PREFIX_MONTHLY} → $${MONTHLY_EXPIRE} days" || \
+          echo "  $${PREFIX_MONTHLY} → (exists or error)"
+
+        echo ""
+        echo "=== MinIO Bucket Configuration ==="
+        echo "Bucket:     $${S3_BUCKET}"
+        echo "Prefix:     $${S3_PREFIX:-<root>}"
+        echo "Policy:     Private"
+        echo "Object Lock: $(mc retention info storage/$${S3_BUCKET} 2>/dev/null | head -1 || echo 'NOT CONFIGURED')"
+        echo ""
+        echo "Lifecycle Rules:"
+        mc ilm rule ls storage/$${S3_BUCKET} 2>/dev/null || echo "  (none)"
+        echo ""
+        echo "=== Retention pro Prefix ==="
+        echo "Last:    2d (no WORM) → $${PREFIX_LAST}"
+        echo "Daily:   $${RETENTION_DAILY}d WORM → $${PREFIX_DAILY}"
+        echo "Weekly:  $${RETENTION_WEEKLY}d WORM → $${PREFIX_WEEKLY}"
+        echo "Monthly: $${RETENTION_MONTHLY}d WORM → $${PREFIX_MONTHLY}"
+        echo ""
+
+  #############################################################################
+  # BACKUP SERVICE
+  #############################################################################
+  #
+  #   Image:  prodrigestivill/postgres-backup-local
+  #   Docs:   https://github.com/prodrigestivill/docker-postgres-backup-local
+  #
+  #   Backups:  /backups/daily/   (BACKUP_KEEP_DAYS)
+  #             /backups/weekly/  (BACKUP_KEEP_WEEKS)
+  #             /backups/monthly/ (BACKUP_KEEP_MONTHS)
+  #
+  #############################################################################
+
+  backup:
+    image: prodrigestivill/postgres-backup-local:${POSTGRES_VERSION:-16}-alpine
+    container_name: ${STACK_NAME:-demo}_backup
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # PostgreSQL
+      POSTGRES_HOST:       postgres
+      POSTGRES_PORT:       5432
+      POSTGRES_DB:         ${POSTGRES_DB:-demodb}
+      POSTGRES_USER:       ${POSTGRES_USER:-demoapp}
+      POSTGRES_PASSWORD:   ${POSTGRES_PASSWORD:-secretpassword}
+      POSTGRES_EXTRA_OPTS: ${BACKUP_EXTRA_OPTS:--Z6 --blobs}
+      # Schedule
+      SCHEDULE:            ${BACKUP_SCHEDULE:-*/5 * * * *}
+      # Retention
+      BACKUP_KEEP_DAYS:    ${BACKUP_KEEP_DAYS:-7}
+      BACKUP_KEEP_WEEKS:   ${BACKUP_KEEP_WEEKS:-4}
+      BACKUP_KEEP_MONTHS:  ${BACKUP_KEEP_MONTHS:-6}
+      # System
+      HEALTHCHECK_PORT:    8080
+      TZ:                  ${TZ:-Etc/UTC}
+    volumes:
+      - backup_data:/backups
+    networks:
+      - backup-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  #############################################################################
+  # S3 SYNC SERVICE (mit granularer WORM-Retention)
+  #############################################################################
+  #
+  #   Synchronisiert /backups nach S3 mit per-Object WORM-Retention:
+  #
+  #   Retention pro Prefix:
+  #   - last/     → kein WORM (stündliche Backups, überschreibbar)
+  #   - daily/    → RETENTION_DAILY   (Default: 14 Tage)
+  #   - weekly/   → RETENTION_WEEKLY  (Default: 35 Tage)
+  #   - monthly/  → RETENTION_MONTHLY (Default: 185 Tage)
+  #
+  #   Alle Backups werden synchronisiert außer Symlinks (*-latest.sql.gz)
+  #
+  #############################################################################
+
+  backup-sync:
+    image: minio/mc:latest
+    container_name: ${STACK_NAME:-demo}_backup_sync
+    depends_on:
+      backup:
+        condition: service_healthy
+    environment:
+      S3_ENDPOINT:   ${S3_ENDPOINT:-http://minio:9000}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin123}
+      S3_BUCKET:     ${S3_BUCKET:-pg-backups}
+      S3_PREFIX:     ${S3_PREFIX:-}
+      S3_REGION:     ${S3_REGION:-}
+      SYNC_INTERVAL: ${SYNC_INTERVAL:-300}
+      TZ:            ${TZ:-Etc/UTC}
+      # Granulare WORM-Retention (in Tagen)
+      RETENTION_DAILY:   ${RETENTION_DAILY:-14}
+      RETENTION_WEEKLY:  ${RETENTION_WEEKLY:-35}
+      RETENTION_MONTHLY: ${RETENTION_MONTHLY:-185}
+    volumes:
+      - backup_data:/backups:ro
+    networks:
+      - backup-network
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        # Build S3 path: bucket/prefix/ or bucket/
+        if [ -n "$${S3_PREFIX}" ]; then
+          S3_PATH="storage/$${S3_BUCKET}/$${S3_PREFIX}"
+        else
+          S3_PATH="storage/$${S3_BUCKET}"
+        fi
+
+        echo ""
+        echo "=== S3 Sync Configuration ==="
+        echo "Endpoint:  $${S3_ENDPOINT}"
+        echo "Bucket:    $${S3_BUCKET}"
+        echo "Prefix:    $${S3_PREFIX:-<none>}"
+        echo "Path:      $${S3_PATH}"
+        echo "Interval:  $${SYNC_INTERVAL}s"
+        echo ""
+        echo "WORM Retention:"
+        echo "  daily/   → $${RETENTION_DAILY} days"
+        echo "  weekly/  → $${RETENTION_WEEKLY} days"
+        echo "  monthly/ → $${RETENTION_MONTHLY} days"
+        echo ""
+
+        mc alias set storage $${S3_ENDPOINT} $${S3_ACCESS_KEY} $${S3_SECRET_KEY}
+
+        # Function: Check if file should be excluded
+        should_exclude() {
+          local file="$$1"
+          case "$$file" in
+            *-latest.sql.gz) return 0 ;;
+            last/*) return 0 ;;
+            *-20[0-9][0-9][0-9][0-9].sql.gz) return 0 ;;
+            *-20[0-9][0-9][0-9][0-9][0-9][0-9].sql.gz) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+
+        # Function: Get retention for prefix
+        get_retention() {
+          local file="$$1"
+          case "$$file" in
+            daily/*) echo "$${RETENTION_DAILY}d" ;;
+            weekly/*) echo "$${RETENTION_WEEKLY}d" ;;
+            monthly/*) echo "$${RETENTION_MONTHLY}d" ;;
+            *) echo "$${RETENTION_DAILY}d" ;;
+          esac
+        }
+
+        # Function: Sync with per-object retention
+        sync_with_retention() {
+          synced=0
+          skipped=0
+          errors=0
+
+          # Process each prefix directory (last without WORM, others with WORM)
+          for prefix in last daily weekly monthly; do
+            # Get retention for this prefix (empty = no WORM)
+            case "$$prefix" in
+              last)    retention="" ;;
+              daily)   retention="$${RETENTION_DAILY}d" ;;
+              weekly)  retention="$${RETENTION_WEEKLY}d" ;;
+              monthly) retention="$${RETENTION_MONTHLY}d" ;;
+            esac
+
+            # Check if directory exists
+            if [ ! -d "/backups/$$prefix" ]; then
+              continue
+            fi
+
+            # Process all .sql.gz files in this prefix
+            for local_file in /backups/$$prefix/*.sql.gz; do
+              # Skip if no files match (glob returns literal pattern)
+              [ -e "$$local_file" ] || continue
+
+              filename=$$(basename "$$local_file")
+
+              # Skip symlinks (latest) only
+              case "$$filename" in
+                *-latest.sql.gz) continue ;;
+              esac
+
+              # Build S3 target path
+              s3_target="$${S3_PATH}/$${prefix}/$${filename}"
+
+              # Check if file already exists on S3
+              if mc stat "$$s3_target" >/dev/null 2>&1; then
+                skipped=$$((skipped + 1))
+                continue
+              fi
+
+              # Upload with or without WORM retention
+              if [ -n "$$retention" ]; then
+                echo "  Uploading: $${prefix}/$${filename} (WORM: $$retention)"
+                if mc cp \
+                  --retention-mode governance \
+                  --retention-duration "$$retention" \
+                  "$$local_file" "$$s3_target" 2>/dev/null; then
+                  synced=$$((synced + 1))
+                else
+                  # Fallback: Upload without retention (for non-WORM buckets)
+                  if mc cp "$$local_file" "$$s3_target" 2>/dev/null; then
+                    synced=$$((synced + 1))
+                    echo "    (uploaded without WORM - bucket may not support Object Lock)"
+                  else
+                    errors=$$((errors + 1))
+                    echo "    ERROR: Failed to upload $${prefix}/$${filename}"
+                  fi
+                fi
+              else
+                # No WORM for last/ (hourly backups)
+                echo "  Uploading: $${prefix}/$${filename}"
+                if mc cp "$$local_file" "$$s3_target" 2>/dev/null; then
+                  synced=$$((synced + 1))
+                else
+                  errors=$$((errors + 1))
+                  echo "    ERROR: Failed to upload $${prefix}/$${filename}"
+                fi
+              fi
+            done
+          done
+
+          echo "  Synced: $$synced new, $$skipped existing, $$errors errors"
+        }
+
+        # Main sync loop
+        while true; do
+          echo "[$(date -u '+%Y-%m-%d %H:%M:%S') UTC] Syncing to S3 with WORM retention..."
+          sync_with_retention
+          echo "[$(date -u '+%Y-%m-%d %H:%M:%S') UTC] Done. Next in $${SYNC_INTERVAL}s"
+          sleep $${SYNC_INTERVAL}
+        done
+
+###############################################################################
+# NETWORKS
+###############################################################################
+
+networks:
+  backup-network:
+    driver: bridge
+    name: ${STACK_NAME:-demo}
+
+###############################################################################
+# VOLUMES
+###############################################################################
+
+volumes:
+  postgres_data:
+    name: ${STACK_NAME:-demo}_pgdata
+  minio_data:
+    name: ${STACK_NAME:-demo}_minio
+  backup_data:
+    name: ${STACK_NAME:-demo}_backups

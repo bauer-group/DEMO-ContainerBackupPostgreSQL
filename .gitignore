@@ -1,0 +1,34 @@
+# =============================================================================
+# PostgreSQL Container Backup Demo - Git Ignore
+# =============================================================================
+
+# Environment (enthält Secrets!)
+.env
+.env.local
+.env.*.local
+
+# Docker Volumes (lokal)
+data/
+backups/
+
+# IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Temporäre Dateien
+*.tmp
+*.temp
+.cache/
