@@ -40,6 +40,12 @@ on:
         type: string
         default: 'errors-only'
 
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  actions: read
+
 jobs:
   notify:
     name: Send Notification
